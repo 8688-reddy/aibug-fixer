@@ -1,0 +1,4 @@
+google-generativeai
+customtkinter
+pyinstaller
+python-dotenv
