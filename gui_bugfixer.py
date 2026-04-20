@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import difflib
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import google.generativeai as genai
@@ -66,6 +67,11 @@ class BugFixerApp(ctk.CTk):
         # Textboxes
         self.original_textbox = ctk.CTkTextbox(self.main_frame, wrap="none", font=("Consolas", 14))
         self.original_textbox.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+        self.original_textbox.bind("<KeyRelease>", self._schedule_original_sync_check)
+        self.original_textbox.bind("<<Paste>>", self._schedule_original_sync_check)
+        self.original_textbox.bind("<<Cut>>", self._schedule_original_sync_check)
+        self.original_textbox.bind("<ButtonRelease-1>", self._schedule_original_sync_check)
+        self.original_textbox.bind("<FocusOut>", self._schedule_original_sync_check)
         
         self.fixed_textbox = ctk.CTkTextbox(self.main_frame, wrap="none", font=("Consolas", 14))
         self.fixed_textbox.grid(row=1, column=1, padx=10, pady=5, sticky="nsew")
@@ -80,6 +86,16 @@ class BugFixerApp(ctk.CTk):
         self.fix_button = ctk.CTkButton(self.bottom_frame, text="Fix Bugs", command=self.fix_bugs, fg_color="#10b981", hover_color="#059669")
         self.fix_button.pack(side="left", padx=10, pady=10)
 
+        self.apply_button = ctk.CTkButton(
+            self.bottom_frame,
+            text="Use Fixed as Original",
+            command=self.apply_fixed_to_original,
+            state="disabled",
+            fg_color="#f59e0b",
+            hover_color="#d97706"
+        )
+        self.apply_button.pack(side="left", padx=10, pady=10)
+
         self.save_button = ctk.CTkButton(self.bottom_frame, text="Save Fixed File", command=self.save_file, state="disabled", fg_color="#8b5cf6", hover_color="#7c3aed")
         self.save_button.pack(side="left", padx=10, pady=10)
         
@@ -87,6 +103,42 @@ class BugFixerApp(ctk.CTk):
         self.status_label.pack(side="right", padx=10, pady=10)
 
         self.current_file_path = None
+        self._sync_job = None
+        self._fixed_output_active = False
+        self._ignore_original_changes = False
+        self.fixed_textbox.tag_config("fixed_change", background="#14532d", foreground="#dcfce7")
+
+    def _clear_fixed_output(self, status_text):
+        self.fixed_textbox.delete("1.0", "end")
+        self.fixed_textbox.tag_remove("fixed_change", "1.0", "end")
+        self.save_button.configure(state="disabled")
+        self.apply_button.configure(state="disabled")
+        self._fixed_output_active = False
+        self.status_label.configure(text=status_text, text_color="#10b981")
+
+    def _normalize_code_for_compare(self, text):
+        lines = text.splitlines()
+        return "\n".join(line.rstrip() for line in lines).strip()
+
+    def _schedule_original_sync_check(self, _event=None):
+        if self._ignore_original_changes or not self._fixed_output_active:
+            return
+
+        # Wait until Tk finishes applying the edit, then clear the fixed panel.
+        self.after_idle(self._clear_fixed_if_original_was_edited)
+
+    def _clear_fixed_if_original_was_edited(self):
+        if self._ignore_original_changes or not self._fixed_output_active:
+            return
+
+        fixed_code = self.fixed_textbox.get("1.0", "end-1c")
+        if not fixed_code.strip():
+            return
+
+        self._clear_fixed_output("Fixed code cleared after editing the original code.")
+
+    def _on_original_text_changed(self, _event=None):
+        self._schedule_original_sync_check()
 
     def load_file(self):
         file_path = filedialog.askopenfilename()
@@ -100,8 +152,11 @@ class BugFixerApp(ctk.CTk):
                 self.original_textbox.insert("1.0", content)
                 
                 self.fixed_textbox.delete("1.0", "end")
+                self.fixed_textbox.tag_remove("fixed_change", "1.0", "end")
+                self._fixed_output_active = False
                 
                 self.save_button.configure(state="disabled")
+                self.apply_button.configure(state="disabled")
                 self.status_label.configure(text=f"Loaded: {os.path.basename(file_path)}", text_color="white")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to read file:\n{e}")
@@ -118,6 +173,7 @@ class BugFixerApp(ctk.CTk):
             return
 
         self.fix_button.configure(state="disabled")
+        self.apply_button.configure(state="disabled")
         self.status_label.configure(text="Analyzing and fixing bugs... Please wait.", text_color="yellow")
         
         # Run in a separate thread so the GUI doesn't freeze
@@ -149,23 +205,54 @@ class BugFixerApp(ctk.CTk):
                 fixed_code = "\n".join(lines)
 
             # Update GUI safely
-            self.after(0, self._on_fix_success, fixed_code)
+            self.after(0, self._on_fix_success, fixed_code, code)
             
         except Exception as e:
             self.after(0, self._on_fix_error, str(e))
 
-    def _on_fix_success(self, fixed_code):
+    def _on_fix_success(self, fixed_code, original_code):
         self.fixed_textbox.delete("1.0", "end")
         self.fixed_textbox.insert("1.0", fixed_code)
+        self.fixed_textbox.tag_remove("fixed_change", "1.0", "end")
+        self.highlight_fixed_lines(original_code, fixed_code)
+        self._fixed_output_active = True
         
         self.fix_button.configure(state="normal")
         self.save_button.configure(state="normal")
-        self.status_label.configure(text="Fix generation complete! You can now save it.", text_color="#10b981")
+        self.apply_button.configure(state="normal")
+        self.status_label.configure(text="Fix generation complete! Review highlighted lines, then apply/save.", text_color="#10b981")
 
     def _on_fix_error(self, error_message):
         self.fix_button.configure(state="normal")
+        self.apply_button.configure(state="disabled")
         self.status_label.configure(text="Error generating fix", text_color="#ef4444")
         messagebox.showerror("Error", f"Failed to fix code:\n{error_message}")
+
+    def highlight_fixed_lines(self, original_code, fixed_code):
+        original_lines = original_code.splitlines()
+        fixed_lines = fixed_code.splitlines()
+
+        matcher = difflib.SequenceMatcher(a=original_lines, b=fixed_lines)
+        for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+
+            for fixed_idx in range(j1, j2):
+                start = f"{fixed_idx + 1}.0"
+                end = f"{fixed_idx + 1}.end"
+                self.fixed_textbox.tag_add("fixed_change", start, end)
+
+    def apply_fixed_to_original(self):
+        fixed_code = self.fixed_textbox.get("1.0", "end-1c")
+        if not fixed_code.strip():
+            messagebox.showwarning("Warning", "No fixed code to apply.")
+            return
+
+        self._ignore_original_changes = True
+        self.original_textbox.delete("1.0", "end")
+        self.original_textbox.insert("1.0", fixed_code)
+        self._clear_fixed_output("Fixed code applied to original editor.")
+        self._ignore_original_changes = False
 
     def save_file(self):
         fixed_code = self.fixed_textbox.get("1.0", "end-1c")
@@ -177,17 +264,25 @@ class BugFixerApp(ctk.CTk):
             # If no file was loaded (e.g., they pasted code), just prompt for save as
             file_path = filedialog.asksaveasfilename(defaultextension=".txt")
         else:
-            base, ext = os.path.splitext(self.current_file_path)
-            default_path = f"{base}_fixed{ext}"
-            
-            initial_dir = os.path.dirname(self.current_file_path)
-            initial_file = os.path.basename(default_path)
-            
-            file_path = filedialog.asksaveasfilename(
-                initialdir=initial_dir,
-                initialfile=initial_file,
-                defaultextension=ext
+            overwrite_original = messagebox.askyesno(
+                "Save Option",
+                "Do you want to replace the original file with fixed code?"
             )
+
+            if overwrite_original:
+                file_path = self.current_file_path
+            else:
+                base, ext = os.path.splitext(self.current_file_path)
+                default_path = f"{base}_fixed{ext}"
+
+                initial_dir = os.path.dirname(self.current_file_path)
+                initial_file = os.path.basename(default_path)
+
+                file_path = filedialog.asksaveasfilename(
+                    initialdir=initial_dir,
+                    initialfile=initial_file,
+                    defaultextension=ext
+                )
             
         if file_path:
             try:
